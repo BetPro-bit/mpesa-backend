@@ -1,0 +1,104 @@
+{
+  "info": {
+    "name": "M-Pesa Daraja API",
+    "_postman_id": "mpesa-daraja-api-collection",
+    "description": "Safaricom Daraja STK Push API — Postman Collection",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:5000" },
+    { "key": "jwt_token", "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6InRlc3QiLCJyb2xlIjoiYWRtaW4iLCJpYXQiOjE3ODEwMTMzsImV4cCI6MTY5Nzg1NH0.J07h5ihfrUCkNsj7pG_rGuXguigZ8JJy-JRjcVZuGhg" },
+    { "key": "checkout_request_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health"
+      }
+    },
+    {
+      "name": "Initiate STK Push",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "  const data = pm.response.json();",
+              "  if (data.data?.checkoutRequestId) {",
+              "    pm.collectionVariables.set('checkout_request_id', data.data.checkoutRequestId);",
+              "    console.log('CheckoutRequestID saved:', data.data.checkoutRequestId);",
+              "  }",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{jwt_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"phone\": \"254708374149\",\n  \"amount\": 1,\n  \"accountReference\": \"ORDER123\",\n  \"transactionDesc\": \"Test Payment\"\n}"
+        },
+        "url": "{{base_url}}/api/payments/stkpush"
+      }
+    },
+    {
+      "name": "Query Transaction",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{jwt_token}}" }
+        ],
+        "url": "{{base_url}}/api/payments/{{checkout_request_id}}"
+      }
+    },
+    {
+      "name": "List Payments",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{jwt_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/payments?page=1&limit=10",
+          "query": [
+            { "key": "page", "value": "1" },
+            { "key": "limit", "value": "10" },
+            { "key": "status", "value": "SUCCESS", "disabled": true }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Simulate Callback (Success)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"Body\": {\n    \"stkCallback\": {\n      \"MerchantRequestID\": \"29115-34620561-1\",\n      \"CheckoutRequestID\": \"{{checkout_request_id}}\",\n      \"ResultCode\": 0,\n      \"ResultDesc\": \"The service request is processed successfully.\",\n      \"CallbackMetadata\": {\n        \"Item\": [\n          { \"Name\": \"Amount\", \"Value\": 1.00 },\n          { \"Name\": \"MpesaReceiptNumber\", \"Value\": \"QGH123456\" },\n          { \"Name\": \"Balance\" },\n          { \"Name\": \"TransactionDate\", \"Value\": 20240101120000 },\n          { \"Name\": \"PhoneNumber\", \"Value\": 254708374149 }\n        ]\n      }\n    }\n  }\n}"
+        },
+        "url": "{{base_url}}/api/payments/callback"
+      }
+    },
+    {
+      "name": "Simulate Callback (Cancelled)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"Body\": {\n    \"stkCallback\": {\n      \"MerchantRequestID\": \"29115-34620561-1\",\n      \"CheckoutRequestID\": \"{{checkout_request_id}}\",\n      \"ResultCode\": 1032,\n      \"ResultDesc\": \"Request cancelled by user.\"\n    }\n  }\n}"
+        },
+        "url": "{{base_url}}/api/payments/callback"
+      }
+    }
+  ]
+}
