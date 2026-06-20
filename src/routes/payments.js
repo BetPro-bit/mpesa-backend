@@ -24,13 +24,13 @@ router.post('/stkpush', auth, async (req, res) => {
     const password = Buffer.from(`${process.env.MPESA_SHORTCODE}${process.env.MPESA_PASSKEY}${timestamp}`).toString('base64');
 
     const response = await axios.post('https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest', {
-      BusinessShortCode: process.env.MPESA_SHORTCODE,
+      BusinessShortCode: process.env.MPESA_SHORTCODE, // Head office shortcode (174379 for Till)
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
+      TransactionType: 'CustomerBuyGoodsOnline',
       Amount: Math.floor(amount),
       PartyA: phone,
-      PartyB: process.env.MPESA_SHORTCODE,
+      PartyB: '3488107',
       PhoneNumber: phone,
       CallBackURL: `${process.env.BACKEND_URL}/api/callback/mpesa`,
       AccountReference: 'BETPRO',
