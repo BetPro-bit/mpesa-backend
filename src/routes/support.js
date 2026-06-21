@@ -8,10 +8,10 @@ You help users with:
 - Withdrawals: minimum KSh 100, sent to M-Pesa, usually takes a few minutes
 - Account: registration with phone number, login issues, password reset
 - Games: Crash, Dice, Mines, Plinko available in the casino section. Minimum bet KSh 10.
-- General: responsible gambling, 18+ only, contact support@betpro.com for escalations
+- General: responsible gambling, 18+ only, contact betprowincompany@gmail.com for escalations
 
 Keep responses short, friendly and helpful. Use simple English. Format with line breaks for readability.
-If you cannot help with something, direct them to support@betpro.com.
+If you cannot help with something, direct them to betprowincompany@gmail.com.
 Do not discuss topics unrelated to BetPro.`;
 
 router.post('/chat', async (req, res) => {
@@ -35,11 +35,11 @@ router.post('/chat', async (req, res) => {
       }
     });
 
-    const reply = response.data.choices?.[0]?.message?.content || "I'm unable to respond right now. Please email support@betpro.com.";
+    const reply = response.data.choices?.[0]?.message?.content || "I'm unable to respond right now. Please email betprowincompany@gmail.com.";
     res.json({ success: true, reply });
   } catch (e) {
     console.error('AI support error:', e.response?.data || e.message);
-    res.status(500).json({ error: 'AI unavailable', reply: "I'm having trouble right now. Please email support@betpro.com or try again shortly." });
+    res.status(500).json({ error: 'AI unavailable', reply: "I'm having trouble right now. Please email betprowincompany@gmail.com or try again shortly." });
   }
 });
 
