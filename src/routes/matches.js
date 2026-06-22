@@ -26,14 +26,15 @@ async function fetchFootball(path, params = {}) {
 }
 
 // GET /api/matches
-// Returns today's matches across all free-tier competitions
+// Returns today's matches — supports ?status=FINISHED for settlement
 router.get('/', async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
-    const data = await fetchFootball('/matches', {
-      dateFrom: today,
-      dateTo: today
-    });
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    const params = req.query.status
+      ? { dateFrom: yesterday, dateTo: today, status: req.query.status }
+      : { dateFrom: today, dateTo: today };
+    const data = await fetchFootball('/matches', params);
     res.json({ success: true, matches: data.matches || [] });
   } catch (e) {
     const status = e.response?.status || 500;
