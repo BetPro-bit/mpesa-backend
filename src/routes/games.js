@@ -347,4 +347,118 @@ router.post('/aviator/crash', auth, async (req, res) => {
   res.json({ success: true, crashAt: session.crash_at });
 });
 
+// ── HORSE RACING ───────────────────────────────────────────────────────────────
+const HR_HORSES_DATA = [
+  { id:1, name:'Thunder Bolt' },
+  { id:2, name:'Gold Rush' },
+  { id:3, name:'Night Storm' },
+  { id:4, name:'Iron Hoof' },
+  { id:5, name:'Lucky Star' },
+  { id:6, name:'Black Wind' },
+  { id:7, name:'Fire Mane' },
+  { id:8, name:'Silver Bolt' },
+];
+
+function generateHorseRace(horses) {
+  // Pre-determine winner using weighted probability (lower odds = higher chance)
+  const weights = horses.map(h => 1 / h.odds);
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * totalWeight;
+  let winnerIdx = 0;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) { winnerIdx = i; break; }
+  }
+  return horses[winnerIdx].id;
+}
+
+function generateHorseOdds(count) {
+  const base = [1.8, 2.2, 2.8, 3.5, 4.2, 5.0, 6.5, 8.0];
+  return base.slice(0, count).map(v => +(v + (Math.random() - 0.5) * 0.4).toFixed(2));
+}
+
+// Start a new horse race round — returns horses with odds, winner hidden
+router.post('/horses/start', auth, async (req, res) => {
+  try {
+    // Pick 6-8 random horses
+    const shuffled = [...HR_HORSES_DATA].sort(() => Math.random() - 0.5);
+    const count = 6 + Math.floor(Math.random() * 3);
+    const selected = shuffled.slice(0, count);
+    const odds = generateHorseOdds(count);
+    const horses = selected.map((h, i) => ({ ...h, odds: odds[i] }));
+
+    // Determine winner server-side (hidden from client)
+    const winnerId = generateHorseRace(horses);
+    const raceId = require('crypto').randomUUID();
+
+    // Store race in DB with winner hidden
+    await supabase.from('game_sessions').insert({
+      id: raceId,
+      user_id: req.user.id,
+      game: 'horses',
+      crash_at: winnerId, // reuse crash_at to store winner ID
+      status: 'active',
+      bet_amount: 0,
+      created_at: new Date()
+    });
+
+    // Return horses and raceId — winner NOT included
+    res.json({ success: true, raceId, horses });
+  } catch(e) {
+    console.error('Horse race start error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Place a bet on a horse
+router.post('/horses/bet', auth, async (req, res) => {
+  const { raceId, horseId, stake } = req.body;
+  if (!stake || stake < 10) return res.status(400).json({ error: 'Minimum bet is KSh 10' });
+
+  const balance = await getBalance(req.user.id);
+  if (balance < stake) return res.status(400).json({ error: 'Insufficient balance' });
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', raceId).eq('user_id', req.user.id).single();
+  if (!session || session.status !== 'active')
+    return res.status(400).json({ error: 'Invalid or expired race' });
+
+  const newBalance = await updateBalance(req.user.id, -stake, `Horse Racing Bet — Horse #${horseId}`);
+
+  await supabase.from('game_sessions').update({
+    bet_amount: stake,
+    slot_1_stake: horseId, // reuse slot fields to store horse selection
+  }).eq('id', raceId);
+
+  res.json({ success: true, balance: newBalance });
+});
+
+// Finish race — reveals winner and settles bet
+router.post('/horses/finish', auth, async (req, res) => {
+  const { raceId } = req.body;
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', raceId).eq('user_id', req.user.id).single();
+  if (!session) return res.status(400).json({ error: 'Race not found' });
+
+  const winnerId = parseInt(session.crash_at); // winner was stored here
+  const selectedHorseId = session.slot_1_stake;
+  const stake = session.bet_amount || 0;
+  const won = selectedHorseId && parseInt(selectedHorseId) === winnerId;
+
+  let winAmount = 0;
+  let newBalance = null;
+
+  if (won && stake > 0) {
+    // Need odds — get from request body
+    const { odds } = req.body;
+    winAmount = parseFloat((stake * (odds || 2)).toFixed(2));
+    newBalance = await updateBalance(req.user.id, winAmount, `Horse Racing Win — Horse #${winnerId} @${odds}x`);
+  }
+
+  await supabase.from('game_sessions').update({ status: 'crashed' }).eq('id', raceId);
+
+  res.json({ success: true, winnerId, won, winAmount, balance: newBalance });
+});
+
 module.exports = router;
