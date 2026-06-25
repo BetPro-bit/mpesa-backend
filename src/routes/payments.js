@@ -7,13 +7,11 @@ const axios = require('axios');
 //  PESAPAL HELPERS
 // ─────────────────────────────────────────────
 
-/** Cache token so we don't re-auth on every request */
 let _pesapalToken = null;
 let _pesapalTokenExpiry = 0;
 
 async function getPesapalToken() {
   if (_pesapalToken && Date.now() < _pesapalTokenExpiry) return _pesapalToken;
-
   const res = await axios.post(
     `${process.env.PESAPAL_BASE_URL}/api/Auth/RequestToken`,
     {
@@ -22,14 +20,11 @@ async function getPesapalToken() {
     },
     { headers: { Accept: 'application/json', 'Content-Type': 'application/json' } }
   );
-
   _pesapalToken = res.data.token;
-  // PesaPal tokens last 5 minutes; refresh 30 s early
   _pesapalTokenExpiry = Date.now() + 4.5 * 60 * 1000;
   return _pesapalToken;
 }
 
-/** Register IPN URL once (idempotent — PesaPal deduplicates by URL) */
 async function ensureIpnRegistered(token) {
   const ipnUrl = `${process.env.BACKEND_URL}/api/callback/pesapal`;
   const res = await axios.post(
@@ -43,10 +38,9 @@ async function ensureIpnRegistered(token) {
       }
     }
   );
-  return res.data.ipn_id;  // store this in env as PESAPAL_IPN_ID after first run
+  return res.data.ipn_id;
 }
 
-/** Normalize phone to 2547XXXXXXXX format required by PesaPal */
 function normalizePhone(phone) {
   const digits = phone.replace(/\D/g, '');
   if (digits.startsWith('254')) return digits;
@@ -56,8 +50,8 @@ function normalizePhone(phone) {
 }
 
 // ─────────────────────────────────────────────
-//  STK PUSH  (now powered by PesaPal)
-//  Same endpoint /api/payments/stkpush — frontend unchanged
+//  STK PUSH via PesaPal
+//  Frontend calls POST /api/payments/stkpush — unchanged
 // ─────────────────────────────────────────────
 router.post('/stkpush', auth, async (req, res) => {
   const { phone, amount } = req.body;
@@ -66,30 +60,31 @@ router.post('/stkpush', auth, async (req, res) => {
 
   try {
     const token = await getPesapalToken();
-
-    // Build a unique merchant reference for this transaction
     const merchantRef = `BETPRO-${req.user.id}-${Date.now()}`;
     const msisdn = normalizePhone(phone);
 
-    // Submit order to PesaPal — this triggers the M-Pesa STK push to the user
+    console.log(`PesaPal STK: phone=${msisdn} amount=${amount} ref=${merchantRef}`);
+
+    const orderPayload = {
+      id: merchantRef,
+      currency: 'KES',
+      amount: Math.floor(amount),
+      description: 'BetPro Deposit',
+      callback_url: `${process.env.BACKEND_URL}/api/callback/pesapal-redirect`,
+      notification_id: process.env.PESAPAL_IPN_ID,
+      billing_address: {
+        phone_number: msisdn,
+        first_name: 'BetPro',
+        last_name: 'User',
+        email_address: `${msisdn}@betpro.app`
+      }
+    };
+
+    console.log('PesaPal order payload:', JSON.stringify(orderPayload));
+
     const orderRes = await axios.post(
       `${process.env.PESAPAL_BASE_URL}/api/Transactions/SubmitOrderRequest`,
-      {
-        id: merchantRef,
-        currency: 'KES',
-        amount: Math.floor(amount),
-        description: 'BetPro Deposit',
-        callback_url: `${process.env.BACKEND_URL}/api/callback/pesapal-redirect`,
-        notification_id: process.env.PESAPAL_IPN_ID,   // set this after registering IPN
-        billing_address: {
-          phone_number: msisdn,
-          // first/last name optional but helps PesaPal records
-          first_name: 'BetPro',
-          last_name: 'User'
-        },
-        // Tell PesaPal to go straight to M-Pesa STK push
-        payment_method: 'MPESA_STK'
-      },
+      orderPayload,
       {
         headers: {
           Accept: 'application/json',
@@ -99,21 +94,32 @@ router.post('/stkpush', auth, async (req, res) => {
       }
     );
 
-    const { order_tracking_id, redirect_url, status } = orderRes.data;
+    console.log('PesaPal order response:', JSON.stringify(orderRes.data));
 
-    // Save pending transaction — use order_tracking_id as checkout_id
+    const { order_tracking_id, redirect_url, error } = orderRes.data;
+
+    if (error && error.code !== '200') {
+      console.error('PesaPal order error:', error);
+      return res.status(500).json({ error: error.message || 'PesaPal order failed' });
+    }
+
+    // Save pending transaction
     await supabase.from('transactions').insert({
       user_id: req.user.id,
       amount,
       description: 'M-Pesa Deposit (pending)',
       status: 'pending',
-      checkout_id: order_tracking_id,   // same column, different value
+      checkout_id: order_tracking_id,
       merchant_ref: merchantRef,
       created_at: new Date()
     });
 
-    // Return the same shape the frontend already expects
-    res.json({ success: true, CheckoutRequestID: order_tracking_id });
+    // Return same shape frontend expects
+    res.json({
+      success: true,
+      CheckoutRequestID: order_tracking_id,
+      redirect_url // frontend can use this if STK doesn't arrive
+    });
   } catch (e) {
     console.error('PesaPal STK error:', e.response?.data || e.message);
     res.status(500).json({ error: 'Deposit initiation failed. Please try again.' });
@@ -121,7 +127,7 @@ router.post('/stkpush', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  PAYMENT STATUS  (unchanged endpoint)
+//  PAYMENT STATUS
 // ─────────────────────────────────────────────
 router.get('/status/:checkoutId', auth, async (req, res) => {
   const { data } = await supabase
@@ -133,7 +139,6 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
 
   if (!data) return res.status(404).json({ error: 'Transaction not found' });
 
-  // Optionally do a live check against PesaPal if still pending
   if (data.status === 'pending') {
     try {
       const token = await getPesapalToken();
@@ -142,7 +147,8 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
         { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
       );
       const ps = statusRes.data;
-      // payment_status_description: 'COMPLETED' | 'FAILED' | 'INVALID' | 'REVERSED'
+      console.log('PesaPal status check:', JSON.stringify(ps));
+
       if (ps.payment_status_description === 'COMPLETED') {
         await supabase.from('transactions')
           .update({ status: 'completed', description: 'M-Pesa Deposit' })
@@ -151,18 +157,18 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
         const { data: user } = await supabase.from('users').select('balance').eq('id', req.user.id).single();
         const newBalance = (user?.balance || 0) + data.amount;
         await supabase.from('users').update({ balance: newBalance }).eq('id', req.user.id);
-
         return res.json({ status: 'completed', amount: data.amount });
       }
-    } catch (_) { /* fall through to DB status */ }
+    } catch (e) {
+      console.error('Status check error:', e.response?.data || e.message);
+    }
   }
 
   res.json({ status: data.status, amount: data.amount });
 });
 
 // ─────────────────────────────────────────────
-//  WITHDRAW  (still uses Daraja B2C — PesaPal
-//  does not support B2C payouts via their API)
+//  WITHDRAW (Daraja B2C — PesaPal doesn't do payouts)
 // ─────────────────────────────────────────────
 router.post('/withdraw', auth, async (req, res) => {
   const { phone, amount } = req.body;
@@ -173,7 +179,6 @@ router.post('/withdraw', auth, async (req, res) => {
   if (!user || user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
   try {
-    // B2C still uses Daraja (PesaPal only handles collections)
     const mpesaAuth = Buffer.from(
       `${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`
     ).toString('base64');
@@ -212,9 +217,7 @@ router.post('/withdraw', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  IPN REGISTRATION HELPER ROUTE
-//  Call once: POST /api/payments/register-ipn
-//  Copy the returned ipn_id into .env as PESAPAL_IPN_ID
+//  IPN REGISTRATION HELPER (run once)
 // ─────────────────────────────────────────────
 router.post('/register-ipn', async (req, res) => {
   try {
@@ -224,6 +227,57 @@ router.post('/register-ipn', async (req, res) => {
   } catch (e) {
     console.error('IPN registration error:', e.response?.data || e.message);
     res.status(500).json({ error: 'IPN registration failed', detail: e.response?.data });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  BUY GOODS / TILL callbacks (kept from original)
+// ─────────────────────────────────────────────
+router.post('/buygoods/callback', async (req, res) => {
+  try {
+    const { TransID, TransAmount, BillRefNumber } = req.body;
+    const amount = parseFloat(TransAmount);
+    const accountRef = BillRefNumber?.toString().trim();
+    const digits = accountRef?.replace(/^\+?254/, '').replace(/^0/, '');
+    const formats = [digits, '0' + digits, '+254' + digits, '254' + digits, accountRef];
+
+    const { data: user } = await supabase
+      .from('users').select('id, balance, phone').in('phone', formats).single();
+
+    if (!user) {
+      console.warn('Paybill: no user found for account ref:', accountRef);
+      return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+    }
+
+    await supabase.from('transactions').insert({
+      user_id: user.id, amount,
+      description: `Buy Goods Deposit (${TransID})`,
+      status: 'completed', checkout_id: TransID, created_at: new Date()
+    });
+
+    const newBalance = (user.balance || 0) + amount;
+    await supabase.from('users').update({ balance: newBalance }).eq('id', user.id);
+    console.log(`Buy Goods: credited KSh ${amount} to user ${user.id}`);
+  } catch (e) {
+    console.error('Buy Goods callback error:', e.message);
+  }
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+router.post('/buygoods/check', auth, async (req, res) => {
+  try {
+    const { data: tx } = await supabase
+      .from('transactions').select('*')
+      .eq('user_id', req.user.id).eq('status', 'completed')
+      .ilike('description', 'Buy Goods Deposit%')
+      .order('created_at', { ascending: false }).limit(1).single();
+
+    if (!tx) return res.json({ success: false, message: 'No recent paybill payment found' });
+    const ageMinutes = (new Date() - new Date(tx.created_at)) / 60000;
+    if (ageMinutes > 10) return res.json({ success: false, message: 'No recent payment found' });
+    res.json({ success: true, amount: tx.amount, transactionId: tx.checkout_id });
+  } catch (e) {
+    res.json({ success: false, message: 'No recent payment found' });
   }
 });
 
