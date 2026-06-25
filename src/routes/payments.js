@@ -149,7 +149,7 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
       const ps = statusRes.data;
       console.log('PesaPal status check:', JSON.stringify(ps));
 
-      if (ps.payment_status_description === 'COMPLETED') {
+      if (ps.payment_status_description?.toLowerCase() === 'completed') {
         await supabase.from('transactions')
           .update({ status: 'completed', description: 'M-Pesa Deposit' })
           .eq('checkout_id', req.params.checkoutId);

@@ -54,7 +54,7 @@ router.post('/pesapal', async (req, res) => {
       return;
     }
 
-    if (payment_status_description === 'COMPLETED') {
+    if (payment_status_description?.toLowerCase() === 'completed') {
       // Mark transaction completed
       await supabase.from('transactions')
         .update({ status: 'completed', description: 'M-Pesa Deposit' })
@@ -67,7 +67,7 @@ router.post('/pesapal', async (req, res) => {
       await supabase.from('users').update({ balance: newBalance }).eq('id', tx.user_id);
 
       console.log(`PesaPal IPN: credited KES ${amount || tx.amount} to user ${tx.user_id}`);
-    } else if (['FAILED', 'INVALID', 'REVERSED'].includes(payment_status_description)) {
+    } else if (['failed', 'invalid', 'reversed'].includes(payment_status_description?.toLowerCase())) {
       await supabase.from('transactions')
         .update({ status: 'failed' })
         .eq('checkout_id', OrderTrackingId);
