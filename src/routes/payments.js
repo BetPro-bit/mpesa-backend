@@ -104,15 +104,15 @@ router.post('/stkpush', auth, async (req, res) => {
     }
 
     // Save pending transaction
-    await supabase.from('transactions').insert({
+    const { error: insertError } = await supabase.from('transactions').insert({
       user_id: req.user.id,
       amount,
       description: 'M-Pesa Deposit (pending)',
       status: 'pending',
       checkout_id: order_tracking_id,
-      merchant_ref: merchantRef,
       created_at: new Date()
     });
+    if (insertError) console.error('Transaction insert error:', insertError.message);
 
     // Return same shape frontend expects
     res.json({
