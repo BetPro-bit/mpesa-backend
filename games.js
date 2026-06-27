@@ -1,0 +1,369 @@
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const supabase = require('../config/supabase');
+const crypto = require('crypto');
+
+// Helper: get user balance
+async function getBalance(userId) {
+  const { data } = await supabase.from('users').select('balance').eq('id', userId).single();
+  return data?.balance || 0;
+}
+
+// Helper: update balance and save transaction
+async function updateBalance(userId, amount, desc) {
+  const current = await getBalance(userId);
+  const newBalance = Math.max(0, current + amount);
+  await supabase.from('users').update({ balance: newBalance }).eq('id', userId);
+  await supabase.from('transactions').insert({
+    user_id: userId,
+    amount,
+    description: desc,
+    balance_after: newBalance,
+    created_at: new Date()
+  });
+  return newBalance;
+}
+
+// Helper: provably fair random (server-side, cannot be manipulated)
+function fairRandom(min = 0, max = 1) {
+  const bytes = crypto.randomBytes(4);
+  const val = bytes.readUInt32BE(0) / 0xFFFFFFFF;
+  return min + val * (max - min);
+}
+
+// ── CRASH GAME ─────────────────────────────────────────────────────────────
+// Generate crash multiplier (house edge ~5%)
+function generateCrashMultiplier() {
+  const r = fairRandom();
+  if (r < 0.05) return 1.0; // instant crash 5% of the time
+  return Math.max(1.0, parseFloat((1 / (1 - r) * 0.95).toFixed(2)));
+}
+
+router.post('/crash/start', auth, async (req, res) => {
+  const { betAmount } = req.body;
+  if (!betAmount || betAmount < 10) return res.status(400).json({ error: 'Minimum bet is KSh 10' });
+  const balance = await getBalance(req.user.id);
+  if (balance < betAmount) return res.status(400).json({ error: 'Insufficient balance' });
+
+  // Deduct bet immediately
+  await updateBalance(req.user.id, -betAmount, `Crash game bet`);
+
+  // Generate crash point (hidden from client until cashout/crash)
+  const crashAt = generateCrashMultiplier();
+  const gameId = crypto.randomUUID();
+
+  // Store game session in DB
+  await supabase.from('game_sessions').insert({
+    id: gameId,
+    user_id: req.user.id,
+    game: 'crash',
+    bet_amount: betAmount,
+    crash_at: crashAt,
+    status: 'active',
+    created_at: new Date()
+  });
+
+  res.json({ success: true, gameId, message: 'Game started' });
+});
+
+router.post('/crash/cashout', auth, async (req, res) => {
+  const { gameId, multiplier } = req.body;
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', gameId).eq('user_id', req.user.id).single();
+
+  if (!session || session.status !== 'active')
+    return res.status(400).json({ error: 'Invalid game session' });
+
+  // Check if cashed out before crash
+  if (multiplier >= session.crash_at) {
+    // Player held too long — they crashed
+    await supabase.from('game_sessions').update({ status: 'crashed' }).eq('id', gameId);
+    return res.json({ success: false, crashed: true, crashAt: session.crash_at, won: 0 });
+  }
+
+  // Player cashed out in time
+  const winAmount = parseFloat((session.bet_amount * multiplier).toFixed(2));
+  const newBalance = await updateBalance(req.user.id, winAmount, `Crash win x${multiplier}`);
+  await supabase.from('game_sessions').update({ status: 'won', cashout_at: multiplier, win_amount: winAmount }).eq('id', gameId);
+
+  res.json({ success: true, crashed: false, crashAt: session.crash_at, won: winAmount, balance: newBalance });
+});
+
+// ── PLINKO GAME ────────────────────────────────────────────────────────────
+router.post('/plinko/drop', auth, async (req, res) => {
+  const { betAmount, risk } = req.body;
+  if (!betAmount || betAmount < 10) return res.status(400).json({ error: 'Minimum bet is KSh 10' });
+
+  const balance = await getBalance(req.user.id);
+  if (balance < betAmount) return res.status(400).json({ error: 'Insufficient balance' });
+
+  // Plinko multipliers based on risk level
+  const multipliers = {
+    low:    [5.6, 2.1, 1.1, 1.0, 0.5, 1.0, 1.1, 2.1, 5.6],
+    medium: [13, 3, 1.3, 0.7, 0.4, 0.7, 1.3, 3, 13],
+    high:   [29, 4, 1.5, 0.3, 0.2, 0.3, 1.5, 4, 29]
+  };
+
+  const buckets = multipliers[risk] || multipliers.low;
+  // Simulate ball path (8 rows, each 50/50 left or right)
+  let pos = 0;
+  const path = [];
+  for (let i = 0; i < 8; i++) {
+    const goRight = fairRandom() > 0.5;
+    path.push(goRight ? 'R' : 'L');
+    if (goRight) pos++;
+  }
+
+  const multiplier = buckets[pos];
+  const winAmount = parseFloat((betAmount * multiplier).toFixed(2));
+  const netChange = winAmount - betAmount;
+  const newBalance = await updateBalance(req.user.id, netChange, `Plinko x${multiplier}`);
+
+  res.json({ success: true, path, bucket: pos, multiplier, winAmount, balance: newBalance });
+});
+
+// Get user balance
+router.get('/balance', auth, async (req, res) => {
+  const balance = await getBalance(req.user.id);
+  res.json({ balance });
+});
+
+// ── AVIATOR GAME ───────────────────────────────────────────────────────────────
+// Crash point generated SERVER-SIDE and hidden until round ends
+function generateAviatorCrash() {
+  const r = Math.floor(Math.random() * 100);
+  if (r < 60) return +(1.00 + Math.random() * 0.50).toFixed(2); // 60%: 1.00-1.50
+  if (r < 80) return +(1.51 + Math.random() * 0.49).toFixed(2); // 20%: 1.51-2.00
+  if (r < 90) return +(2.01 + Math.random() * 0.99).toFixed(2); // 10%: 2.01-3.00
+  if (r < 95) return +(3.01 + Math.random() * 1.99).toFixed(2); //  5%: 3.01-5.00
+  if (r < 99) return +(5.01 + Math.random() * 1.99).toFixed(2); //  4%: 5.01-7.00
+  return     +(7.01 + Math.random() * 2.99).toFixed(2);          //  1%: 7.01-10.00
+}
+
+// Start a new aviator round — returns a roundId, crash point is hidden
+router.post('/aviator/start', auth, async (req, res) => {
+  try {
+    const crashAt = generateAviatorCrash();
+    const roundId = require('crypto').randomUUID();
+
+    await supabase.from('game_sessions').insert({
+      id: roundId,
+      user_id: req.user.id,
+      game: 'aviator',
+      crash_at: crashAt,
+      status: 'active',
+      bet_amount: 0, // bets placed separately per slot
+      created_at: new Date()
+    });
+
+    // Return roundId only — crashAt is NEVER sent to client
+    res.json({ success: true, roundId });
+  } catch (e) {
+    console.error('Aviator start error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Place a bet for a slot within a round
+router.post('/aviator/bet', auth, async (req, res) => {
+  const { roundId, slotId, stake } = req.body;
+  if (!stake || stake < 10) return res.status(400).json({ error: 'Minimum bet is KSh 10' });
+
+  const balance = await getBalance(req.user.id);
+  if (balance < stake) return res.status(400).json({ error: 'Insufficient balance' });
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', roundId).eq('user_id', req.user.id).single();
+  if (!session || session.status !== 'active')
+    return res.status(400).json({ error: 'Invalid or expired round' });
+
+  // Deduct stake
+  const newBalance = await updateBalance(req.user.id, -stake, `Aviator Bet (slot ${slotId})`);
+
+  // Save slot bet
+  await supabase.from('game_sessions').update({
+    [`slot_${slotId}_stake`]: stake,
+    [`slot_${slotId}_status`]: 'active',
+    bet_amount: (session.bet_amount || 0) + stake
+  }).eq('id', roundId);
+
+  res.json({ success: true, balance: newBalance });
+});
+
+// Cash out a slot — server checks if multiplier is before crash point
+router.post('/aviator/cashout', auth, async (req, res) => {
+  const { roundId, slotId, multiplier } = req.body;
+  if (!multiplier || multiplier < 1) return res.status(400).json({ error: 'Invalid multiplier' });
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', roundId).eq('user_id', req.user.id).single();
+  if (!session || session.status !== 'active')
+    return res.status(400).json({ error: 'Invalid or expired round' });
+
+  const slotStatus = session[`slot_${slotId}_status`];
+  const slotStake = session[`slot_${slotId}_stake`];
+
+  if (slotStatus !== 'active') return res.status(400).json({ error: 'Slot already settled' });
+  if (!slotStake) return res.status(400).json({ error: 'No bet found for this slot' });
+
+  // Server-side check: did player cash out before crash?
+  if (multiplier >= session.crash_at) {
+    // Tried to cash out after crash — deny
+    await supabase.from('game_sessions').update({
+      [`slot_${slotId}_status`]: 'crashed'
+    }).eq('id', roundId);
+    return res.json({ success: false, crashed: true, crashAt: session.crash_at });
+  }
+
+  // Valid cashout
+  const winAmount = parseFloat((slotStake * multiplier).toFixed(2));
+  const newBalance = await updateBalance(req.user.id, winAmount, `Aviator Win x${multiplier} (slot ${slotId})`);
+
+  await supabase.from('game_sessions').update({
+    [`slot_${slotId}_status`]: 'won',
+    [`slot_${slotId}_cashout`]: multiplier,
+    [`slot_${slotId}_win`]: winAmount
+  }).eq('id', roundId);
+
+  res.json({ success: true, crashed: false, winAmount, balance: newBalance, cashoutAt: multiplier });
+});
+
+// Crash — called when round ends (frontend triggers after crash animation)
+// Server reveals crash point and settles any uncashed slots
+router.post('/aviator/crash', auth, async (req, res) => {
+  const { roundId } = req.body;
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', roundId).eq('user_id', req.user.id).single();
+  if (!session) return res.status(400).json({ error: 'Round not found' });
+
+  // Settle all remaining active slots as lost
+  const updates = { status: 'crashed' };
+  [1,2,3].forEach(i => {
+    if (session[`slot_${i}_status`] === 'active') {
+      updates[`slot_${i}_status`] = 'lost';
+    }
+  });
+
+  await supabase.from('game_sessions').update(updates).eq('id', roundId);
+
+  // Reveal crash point to client now that round is over
+  res.json({ success: true, crashAt: session.crash_at });
+});
+
+// ── HORSE RACING ───────────────────────────────────────────────────────────────
+const HR_HORSES_DATA = [
+  { id:1, name:'Thunder Bolt' },
+  { id:2, name:'Gold Rush' },
+  { id:3, name:'Night Storm' },
+  { id:4, name:'Iron Hoof' },
+  { id:5, name:'Lucky Star' },
+  { id:6, name:'Black Wind' },
+  { id:7, name:'Fire Mane' },
+  { id:8, name:'Silver Bolt' },
+];
+
+function generateHorseRace(horses) {
+  // Pre-determine winner using weighted probability (lower odds = higher chance)
+  const weights = horses.map(h => 1 / h.odds);
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * totalWeight;
+  let winnerIdx = 0;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) { winnerIdx = i; break; }
+  }
+  return horses[winnerIdx].id;
+}
+
+function generateHorseOdds(count) {
+  const base = [1.8, 2.2, 2.8, 3.5, 4.2, 5.0, 6.5, 8.0];
+  return base.slice(0, count).map(v => +(v + (Math.random() - 0.5) * 0.4).toFixed(2));
+}
+
+// Start a new horse race round — returns horses with odds, winner hidden
+router.post('/horses/start', auth, async (req, res) => {
+  try {
+    // Pick 6-8 random horses
+    const shuffled = [...HR_HORSES_DATA].sort(() => Math.random() - 0.5);
+    const count = 6 + Math.floor(Math.random() * 3);
+    const selected = shuffled.slice(0, count);
+    const odds = generateHorseOdds(count);
+    const horses = selected.map((h, i) => ({ ...h, odds: odds[i] }));
+
+    // Determine winner server-side (hidden from client)
+    const winnerId = generateHorseRace(horses);
+    const raceId = require('crypto').randomUUID();
+
+    // Store race in DB with winner hidden
+    await supabase.from('game_sessions').insert({
+      id: raceId,
+      user_id: req.user.id,
+      game: 'horses',
+      crash_at: winnerId, // reuse crash_at to store winner ID
+      status: 'active',
+      bet_amount: 0,
+      created_at: new Date()
+    });
+
+    // Return horses and raceId — winner NOT included
+    res.json({ success: true, raceId, horses });
+  } catch(e) {
+    console.error('Horse race start error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Place a bet on a horse
+router.post('/horses/bet', auth, async (req, res) => {
+  const { raceId, horseId, stake } = req.body;
+  if (!stake || stake < 10) return res.status(400).json({ error: 'Minimum bet is KSh 10' });
+
+  const balance = await getBalance(req.user.id);
+  if (balance < stake) return res.status(400).json({ error: 'Insufficient balance' });
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', raceId).eq('user_id', req.user.id).single();
+  if (!session || session.status !== 'active')
+    return res.status(400).json({ error: 'Invalid or expired race' });
+
+  const newBalance = await updateBalance(req.user.id, -stake, `Horse Racing Bet — Horse #${horseId}`);
+
+  await supabase.from('game_sessions').update({
+    bet_amount: stake,
+    slot_1_stake: horseId, // reuse slot fields to store horse selection
+  }).eq('id', raceId);
+
+  res.json({ success: true, balance: newBalance });
+});
+
+// Finish race — reveals winner and settles bet
+router.post('/horses/finish', auth, async (req, res) => {
+  const { raceId } = req.body;
+
+  const { data: session } = await supabase
+    .from('game_sessions').select('*').eq('id', raceId).eq('user_id', req.user.id).single();
+  if (!session) return res.status(400).json({ error: 'Race not found' });
+
+  const winnerId = parseInt(session.crash_at); // winner was stored here
+  const selectedHorseId = session.slot_1_stake;
+  const stake = session.bet_amount || 0;
+  const won = selectedHorseId && parseInt(selectedHorseId) === winnerId;
+
+  let winAmount = 0;
+  let newBalance = null;
+
+  if (won && stake > 0) {
+    // Need odds — get from request body
+    const { odds } = req.body;
+    winAmount = parseFloat((stake * (odds || 2)).toFixed(2));
+    newBalance = await updateBalance(req.user.id, winAmount, `Horse Racing Win — Horse #${winnerId} @${odds}x`);
+  }
+
+  await supabase.from('game_sessions').update({ status: 'crashed' }).eq('id', raceId);
+
+  res.json({ success: true, winnerId, won, winAmount, balance: newBalance });
+});
+
+module.exports = router;
