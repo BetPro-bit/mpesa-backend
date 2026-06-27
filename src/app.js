@@ -9,11 +9,12 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date() }));
 
 // Routes
-app.use('/api/auth', require('./routes/auth'));
+const { router: authRouter } = require('./routes/auth');
+app.use('/api/auth', authRouter);
 app.use('/api/payments', require('./routes/payments'));
 app.use('/api/games', require('./routes/games'));
 app.use('/api/callback', require('./routes/callback'));
-app.use('/api/support',  require('./routes/support'));
+app.use('/api/support', require('./routes/support'));
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
