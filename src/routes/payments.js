@@ -168,51 +168,69 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  WITHDRAW (Daraja B2C — PesaPal doesn't do payouts)
+//  WITHDRAW (Manual — admin pays via PesaPal)
 // ─────────────────────────────────────────────
 router.post('/withdraw', auth, async (req, res) => {
   const { phone, amount } = req.body;
   if (!phone || !amount) return res.status(400).json({ error: 'Phone and amount required' });
   if (amount < 100) return res.status(400).json({ error: 'Minimum withdrawal is KSh 100' });
 
-  const { data: user } = await supabase.from('users').select('balance').eq('id', req.user.id).single();
+  const { data: user } = await supabase.from('users').select('balance, phone').eq('id', req.user.id).single();
   if (!user || user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
   try {
-    const mpesaAuth = Buffer.from(
-      `${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`
-    ).toString('base64');
-    const tokenRes = await axios.get(
-      'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
-      { headers: { Authorization: `Basic ${mpesaAuth}` } }
-    );
-    const mpesaToken = tokenRes.data.access_token;
-
-    await axios.post('https://api.safaricom.co.ke/mpesa/b2c/v3/paymentrequest', {
-      OriginatorConversationID: `BETPRO-${Date.now()}`,
-      InitiatorName: process.env.MPESA_INITIATOR_NAME,
-      SecurityCredential: process.env.MPESA_SECURITY_CREDENTIAL,
-      CommandID: 'BusinessPayment',
-      Amount: Math.floor(amount),
-      PartyA: process.env.MPESA_SHORTCODE,
-      PartyB: phone,
-      Remarks: 'BetPro Withdrawal',
-      QueueTimeOutURL: `${process.env.BACKEND_URL}/api/callback/timeout`,
-      ResultURL: `${process.env.BACKEND_URL}/api/callback/withdraw`
-    }, { headers: { Authorization: `Bearer ${mpesaToken}` } });
-
+    // Deduct balance immediately
     const newBalance = user.balance - amount;
     await supabase.from('users').update({ balance: newBalance }).eq('id', req.user.id);
+
+    // Save withdrawal request as pending
     await supabase.from('transactions').insert({
-      user_id: req.user.id, amount: -amount,
-      description: 'M-Pesa Withdrawal', status: 'completed',
+      user_id: req.user.id,
+      amount: -amount,
+      description: `M-Pesa Withdrawal to ${phone}`,
+      status: 'pending',
       created_at: new Date()
     });
 
-    res.json({ success: true, message: `KSh ${amount} sent to ${phone}`, balance: newBalance });
+    // Send email notification to admin via Resend
+    try {
+      await axios.post('https://api.resend.com/emails', {
+        from: 'BetPro Win <onboarding@resend.dev>',
+        to: process.env.ADMIN_EMAIL,
+        subject: `💸 New Withdrawal Request — KSh ${amount}`,
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto">
+            <h2 style="color:#00ff87">🏆 BetPro Win — Withdrawal Request</h2>
+            <table style="width:100%;border-collapse:collapse">
+              <tr><td style="padding:8px;font-weight:bold">Amount:</td><td style="padding:8px;color:#e74c3c;font-size:20px;font-weight:bold">KSh ${amount.toLocaleString()}</td></tr>
+              <tr style="background:#f9f9f9"><td style="padding:8px;font-weight:bold">Send to:</td><td style="padding:8px;font-size:18px;font-weight:bold">${phone}</td></tr>
+              <tr><td style="padding:8px;font-weight:bold">User Phone:</td><td style="padding:8px">${user.phone}</td></tr>
+              <tr style="background:#f9f9f9"><td style="padding:8px;font-weight:bold">User ID:</td><td style="padding:8px">${req.user.id}</td></tr>
+              <tr><td style="padding:8px;font-weight:bold">Time:</td><td style="padding:8px">${new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}</td></tr>
+            </table>
+            <p style="margin-top:20px;color:#666">Please send KSh ${amount} to <strong>${phone}</strong> via M-Pesa or PesaPal dashboard.</p>
+            <p style="color:#999;font-size:12px">BetPro Win Admin Panel</p>
+          </div>
+        `
+      }, {
+        headers: {
+          'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      console.log(`Withdrawal email sent: KSh ${amount} to ${phone}`);
+    } catch (emailErr) {
+      console.error('Email notification error:', emailErr.response?.data || emailErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: `Withdrawal request of KSh ${amount} submitted. You will receive your money within 24 hours.`,
+      balance: newBalance
+    });
   } catch (e) {
-    console.error('Withdraw error:', e.response?.data || e.message);
-    res.status(500).json({ error: 'Withdrawal failed' });
+    console.error('Withdraw error:', e.message);
+    res.status(500).json({ error: 'Withdrawal failed. Please try again.' });
   }
 });
 
