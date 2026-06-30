@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const supabase = require('../config/supabase');
 const auth = require('../middleware/auth');
+const axios = require('axios');
 
 // ─── Firebase Admin for push notifications ───────────────────────────────────
 let firebaseAdmin = null;
@@ -103,6 +104,80 @@ router.post('/notify-all', async (req, res) => {
     }
     res.json({ success: true, sent });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Admin: User count ──────────────────────────────────────────────────────
+router.post('/user-count', async (req, res) => {
+  const { secret } = req.body;
+  if (secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const { count, error } = await supabase.from('users').select('*', { count: 'exact', head: true });
+    if (error) throw error;
+    res.json({ success: true, count: count || 0 });
+  } catch (e) {
+    console.error('User count error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Admin: Broadcast email to all users ────────────────────────────────────
+router.post('/broadcast-email', async (req, res) => {
+  const { secret, subject, body } = req.body;
+  if (secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  if (!subject || !body) return res.status(400).json({ error: 'Subject and body required' });
+
+  try {
+    // Pull all users with a real email (skip the synthetic betpro.app ones if no real_email saved)
+    const { data: users, error } = await supabase.from('users').select('email, phone');
+    if (error) throw error;
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const user of users) {
+      if (!user.email) { failed++; continue; }
+      try {
+        const personalized = body
+          .replace(/{name}/g, user.phone || 'there')
+          .replace(/\n/g, '<br>');
+
+        await axios.post('https://api.resend.com/emails', {
+          from: 'BetPro Win <onboarding@resend.dev>',
+          to: user.email,
+          subject,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;background:#080c10;color:#f2f5f7;padding:24px;border-radius:14px">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px">
+                <div style="width:32px;height:32px;background:#00ff87;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px">🎯</div>
+                <div style="font-size:16px;font-weight:800">Bet<span style="color:#00ff87">Pro</span> Win</div>
+              </div>
+              <div style="font-size:14px;line-height:1.6;color:#d8e0e6">${personalized}</div>
+              <div style="margin-top:24px;padding-top:16px;border-top:1px solid #1d2630;font-size:11px;color:#8b97a3">
+                BetPro Win — Bet Smart. Win Big.<br>18+ only. Play responsibly.
+              </div>
+            </div>
+          `
+        }, {
+          headers: {
+            'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        sent++;
+        // Small delay to respect Resend rate limits (2 req/sec on free tier)
+        await new Promise(r => setTimeout(r, 550));
+      } catch (emailErr) {
+        console.error(`Broadcast email failed for ${user.email}:`, emailErr.response?.data?.message || emailErr.message);
+        failed++;
+      }
+    }
+
+    console.log(`Broadcast complete: ${sent} sent, ${failed} failed`);
+    res.json({ success: true, sent, failed });
+  } catch (e) {
+    console.error('Broadcast error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
