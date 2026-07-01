@@ -46,7 +46,7 @@ async function sendPushNotification(fcmToken, title, body) {
 
 // ─── Register ─────────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
-  const { phone, email, password, country } = req.body;
+  const { phone, email, password, country, ref } = req.body;
   if (!phone || !email || !password) return res.status(400).json({ error: 'Missing fields' });
   const sbEmail = phone.replace(/^0/, '254') + '@betpro.app';
   const { data, error } = await supabase.auth.admin.createUser({
@@ -55,7 +55,22 @@ router.post('/register', async (req, res) => {
     email_confirm: true
   });
   if (error) return res.status(400).json({ error: error.message });
-  await supabase.from('users').insert({ id: data.user.id, phone, email, balance: 0, country });
+
+  // Generate unique referral code for this new user
+  const referralCode = 'BP' + Math.random().toString(36).slice(2, 8).toUpperCase();
+
+  // Resolve referrer (if a valid ref code was passed)
+  let referredBy = null;
+  if (ref) {
+    const { data: referrer } = await supabase.from('users').select('id').eq('referral_code', ref).single();
+    if (referrer) referredBy = referrer.id;
+  }
+
+  await supabase.from('users').insert({
+    id: data.user.id, phone, email, balance: 0, country,
+    referral_code: referralCode,
+    referred_by: referredBy
+  });
   res.json({ success: true, message: 'Account created successfully' });
 });
 
@@ -179,6 +194,41 @@ router.post('/broadcast-email', async (req, res) => {
   } catch (e) {
     console.error('Broadcast error:', e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Referral: Get my code + stats ───────────────────────────────────────────
+router.get('/referral-stats', auth, async (req, res) => {
+  try {
+    const { data: me } = await supabase
+      .from('users')
+      .select('referral_code, referral_earnings')
+      .eq('id', req.user.id)
+      .single();
+
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    // Ensure user always has a code (covers users created before this feature)
+    let code = me.referral_code;
+    if (!code) {
+      code = 'BP' + Math.random().toString(36).slice(2, 8).toUpperCase();
+      await supabase.from('users').update({ referral_code: code }).eq('id', req.user.id);
+    }
+
+    const { count } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .eq('referred_by', req.user.id);
+
+    res.json({
+      success: true,
+      code,
+      totalInvited: count || 0,
+      totalEarned: me.referral_earnings || 0
+    });
+  } catch (e) {
+    console.error('Referral stats error:', e.message);
+    res.status(500).json({ error: 'Failed to load referral stats' });
   }
 });
 

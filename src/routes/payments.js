@@ -41,6 +41,56 @@ async function ensureIpnRegistered(token) {
   return res.data.ipn_id;
 }
 
+// ─────────────────────────────────────────────
+//  REFERRAL BONUS — pays KSh 50 to the inviter
+//  the FIRST time their invited friend deposits.
+//  Safe to call multiple times: it no-ops if
+//  already paid or if user has no referrer.
+// ─────────────────────────────────────────────
+const REFERRAL_BONUS = 50;
+
+async function payReferralBonusIfEligible(newUserId) {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, referred_by, referral_bonus_paid')
+      .eq('id', newUserId)
+      .single();
+
+    if (!user || !user.referred_by || user.referral_bonus_paid) return;
+
+    const { data: referrer } = await supabase
+      .from('users')
+      .select('id, balance, referral_earnings')
+      .eq('id', user.referred_by)
+      .single();
+
+    if (!referrer) return;
+
+    const newReferrerBalance = (referrer.balance || 0) + REFERRAL_BONUS;
+    const newReferralEarnings = (referrer.referral_earnings || 0) + REFERRAL_BONUS;
+
+    await supabase.from('users').update({
+      balance: newReferrerBalance,
+      referral_earnings: newReferralEarnings
+    }).eq('id', referrer.id);
+
+    await supabase.from('users').update({ referral_bonus_paid: true }).eq('id', newUserId);
+
+    await supabase.from('transactions').insert({
+      user_id: referrer.id,
+      amount: REFERRAL_BONUS,
+      description: 'Referral Bonus — Friend Deposited 🎉',
+      status: 'completed',
+      created_at: new Date()
+    });
+
+    console.log(`Referral bonus: KSh ${REFERRAL_BONUS} paid to ${referrer.id} for inviting ${newUserId}`);
+  } catch (e) {
+    console.error('Referral bonus error:', e.message);
+  }
+}
+
 function normalizePhone(phone) {
   const digits = phone.replace(/\D/g, '');
   if (digits.startsWith('254')) return digits;
@@ -157,6 +207,10 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
         const { data: user } = await supabase.from('users').select('balance').eq('id', req.user.id).single();
         const newBalance = (user?.balance || 0) + data.amount;
         await supabase.from('users').update({ balance: newBalance }).eq('id', req.user.id);
+
+        // Pay referral bonus to inviter if this is user's first deposit
+        await payReferralBonusIfEligible(req.user.id);
+
         return res.json({ status: 'completed', amount: data.amount });
       }
     } catch (e) {

@@ -2,6 +2,32 @@ const router = require('express').Router();
 const supabase = require('../config/supabase');
 const axios = require('axios');
 
+// ─── Referral bonus helper (duplicated here to keep callback.js self-contained)
+const REFERRAL_BONUS = 50;
+async function payReferralBonusIfEligible(newUserId) {
+  try {
+    const { data: user } = await supabase
+      .from('users').select('id, referred_by, referral_bonus_paid').eq('id', newUserId).single();
+    if (!user || !user.referred_by || user.referral_bonus_paid) return;
+    const { data: referrer } = await supabase
+      .from('users').select('id, balance, referral_earnings').eq('id', user.referred_by).single();
+    if (!referrer) return;
+    await supabase.from('users').update({
+      balance: (referrer.balance || 0) + REFERRAL_BONUS,
+      referral_earnings: (referrer.referral_earnings || 0) + REFERRAL_BONUS
+    }).eq('id', referrer.id);
+    await supabase.from('users').update({ referral_bonus_paid: true }).eq('id', newUserId);
+    await supabase.from('transactions').insert({
+      user_id: referrer.id, amount: REFERRAL_BONUS,
+      description: 'Referral Bonus — Friend Deposited 🎉',
+      status: 'completed', created_at: new Date()
+    });
+    console.log(`Referral bonus: KSh ${REFERRAL_BONUS} paid to ${referrer.id}`);
+  } catch (e) {
+    console.error('Referral bonus error:', e.message);
+  }
+}
+
 // ─────────────────────────────────────────────
 //  PESAPAL IPN CALLBACK
 //  PesaPal POSTs here when a payment completes/fails
@@ -65,6 +91,9 @@ router.post('/pesapal', async (req, res) => {
         .from('users').select('balance').eq('id', tx.user_id).single();
       const newBalance = (user?.balance || 0) + (amount || tx.amount);
       await supabase.from('users').update({ balance: newBalance }).eq('id', tx.user_id);
+
+      // Pay referral bonus if this is first deposit
+      await payReferralBonusIfEligible(tx.user_id);
 
       console.log(`PesaPal IPN: credited KES ${amount || tx.amount} to user ${tx.user_id}`);
     } else if (['failed', 'invalid', 'reversed'].includes(payment_status_description?.toLowerCase())) {
