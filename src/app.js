@@ -3,7 +3,9 @@ const cors = require('cors');
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }, // needed for FXS Pay webhook signature verification
+}));
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date() }));
