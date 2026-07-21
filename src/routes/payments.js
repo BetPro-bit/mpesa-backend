@@ -4,48 +4,20 @@ const supabase = require('../config/supabase');
 const axios = require('axios');
 
 // ─────────────────────────────────────────────
-//  PESAPAL HELPERS
+//  FXS PAY CONFIG
+//  FXSPAY_BASE_URL   e.g. https://fxspay.onrender.com
+//  FXSPAY_API_KEY    BetPro Win's own fxs_live_... key
 // ─────────────────────────────────────────────
-
-let _pesapalToken = null;
-let _pesapalTokenExpiry = 0;
-
-async function getPesapalToken() {
-  if (_pesapalToken && Date.now() < _pesapalTokenExpiry) return _pesapalToken;
-  const res = await axios.post(
-    `${process.env.PESAPAL_BASE_URL}/api/Auth/RequestToken`,
-    {
-      consumer_key: process.env.PESAPAL_CONSUMER_KEY,
-      consumer_secret: process.env.PESAPAL_CONSUMER_SECRET
-    },
-    { headers: { Accept: 'application/json', 'Content-Type': 'application/json' } }
-  );
-  _pesapalToken = res.data.token;
-  _pesapalTokenExpiry = Date.now() + 4.5 * 60 * 1000;
-  return _pesapalToken;
-}
-
-async function ensureIpnRegistered(token) {
-  const ipnUrl = `${process.env.BACKEND_URL}/api/callback/pesapal`;
-  const res = await axios.post(
-    `${process.env.PESAPAL_BASE_URL}/api/URLSetup/RegisterIPN`,
-    { url: ipnUrl, ipn_notification_type: 'POST' },
-    {
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      }
-    }
-  );
-  return res.data.ipn_id;
+function fxsHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.FXSPAY_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
 }
 
 // ─────────────────────────────────────────────
 //  REFERRAL BONUS — pays KSh 50 to the inviter
 //  the FIRST time their invited friend deposits.
-//  Safe to call multiple times: it no-ops if
-//  already paid or if user has no referrer.
 // ─────────────────────────────────────────────
 const REFERRAL_BONUS = 50;
 
@@ -67,12 +39,9 @@ async function payReferralBonusIfEligible(newUserId) {
 
     if (!referrer) return;
 
-    const newReferrerBalance = (referrer.balance || 0) + REFERRAL_BONUS;
-    const newReferralEarnings = (referrer.referral_earnings || 0) + REFERRAL_BONUS;
-
     await supabase.from('users').update({
-      balance: newReferrerBalance,
-      referral_earnings: newReferralEarnings
+      balance: (referrer.balance || 0) + REFERRAL_BONUS,
+      referral_earnings: (referrer.referral_earnings || 0) + REFERRAL_BONUS
     }).eq('id', referrer.id);
 
     await supabase.from('users').update({ referral_bonus_paid: true }).eq('id', newUserId);
@@ -100,8 +69,9 @@ function normalizePhone(phone) {
 }
 
 // ─────────────────────────────────────────────
-//  STK PUSH via PesaPal
-//  Frontend calls POST /api/payments/stkpush — unchanged
+//  STK PUSH via FXS PAY
+//  Frontend calls POST /api/payments/stkpush — unchanged contract:
+//  returns { success, CheckoutRequestID, redirect_url }
 // ─────────────────────────────────────────────
 router.post('/stkpush', auth, async (req, res) => {
   const { phone, amount } = req.body;
@@ -109,69 +79,34 @@ router.post('/stkpush', auth, async (req, res) => {
   if (amount < 20) return res.status(400).json({ error: 'Minimum deposit is KSh 20' });
 
   try {
-    const token = await getPesapalToken();
-    const merchantRef = `BETPRO-${req.user.id}-${Date.now()}`;
     const msisdn = normalizePhone(phone);
+    console.log(`FXS Pay STK: phone=${msisdn} amount=${amount} user=${req.user.id}`);
 
-    console.log(`PesaPal STK: phone=${msisdn} amount=${amount} ref=${merchantRef}`);
-
-    const orderPayload = {
-      id: merchantRef,
-      currency: 'KES',
-      amount: Math.floor(amount),
-      description: 'BetPro Deposit',
-      callback_url: `${process.env.BACKEND_URL}/api/callback/pesapal-redirect`,
-      notification_id: process.env.PESAPAL_IPN_ID,
-      billing_address: {
-        phone_number: msisdn,
-        first_name: 'BetPro',
-        last_name: 'User',
-        email_address: `${msisdn}@betpro.app`
-      }
-    };
-
-    console.log('PesaPal order payload:', JSON.stringify(orderPayload));
-
-    const orderRes = await axios.post(
-      `${process.env.PESAPAL_BASE_URL}/api/Transactions/SubmitOrderRequest`,
-      orderPayload,
-      {
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        }
-      }
+    const fxsRes = await axios.post(
+      `${process.env.FXSPAY_BASE_URL}/api/mpesa/stk-push`,
+      { phone: msisdn, amount, description: 'BetPro Deposit' },
+      { headers: fxsHeaders() }
     );
 
-    console.log('PesaPal order response:', JSON.stringify(orderRes.data));
+    const { transactionId } = fxsRes.data;
 
-    const { order_tracking_id, redirect_url, error } = orderRes.data;
-
-    if (error && error.code !== '200') {
-      console.error('PesaPal order error:', error);
-      return res.status(500).json({ error: error.message || 'PesaPal order failed' });
-    }
-
-    // Save pending transaction
     const { error: insertError } = await supabase.from('transactions').insert({
       user_id: req.user.id,
       amount,
       description: 'M-Pesa Deposit (pending)',
       status: 'pending',
-      checkout_id: order_tracking_id,
+      checkout_id: transactionId,
       created_at: new Date()
     });
     if (insertError) console.error('Transaction insert error:', insertError.message);
 
-    // Return same shape frontend expects
     res.json({
       success: true,
-      CheckoutRequestID: order_tracking_id,
-      redirect_url // frontend can use this if STK doesn't arrive
+      CheckoutRequestID: transactionId,
+      redirect_url: null
     });
   } catch (e) {
-    console.error('PesaPal STK error:', e.response?.data || e.message);
+    console.error('FXS Pay STK error:', e.response?.data || e.message);
     res.status(500).json({ error: 'Deposit initiation failed. Please try again.' });
   }
 });
@@ -191,15 +126,14 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
 
   if (data.status === 'pending') {
     try {
-      const token = await getPesapalToken();
       const statusRes = await axios.get(
-        `${process.env.PESAPAL_BASE_URL}/api/Transactions/GetTransactionStatus?orderTrackingId=${req.params.checkoutId}`,
-        { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+        `${process.env.FXSPAY_BASE_URL}/api/mpesa/status/${req.params.checkoutId}`,
+        { headers: fxsHeaders() }
       );
-      const ps = statusRes.data;
-      console.log('PesaPal status check:', JSON.stringify(ps));
+      const fxsStatus = statusRes.data.transaction?.status;
+      console.log('FXS Pay status check:', fxsStatus);
 
-      if (ps.payment_status_description?.toLowerCase() === 'completed') {
+      if (fxsStatus === 'success') {
         await supabase.from('transactions')
           .update({ status: 'completed', description: 'M-Pesa Deposit' })
           .eq('checkout_id', req.params.checkoutId);
@@ -208,10 +142,14 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
         const newBalance = (user?.balance || 0) + data.amount;
         await supabase.from('users').update({ balance: newBalance }).eq('id', req.user.id);
 
-        // Pay referral bonus to inviter if this is user's first deposit
         await payReferralBonusIfEligible(req.user.id);
 
         return res.json({ status: 'completed', amount: data.amount });
+      } else if (fxsStatus === 'failed') {
+        await supabase.from('transactions')
+          .update({ status: 'failed' })
+          .eq('checkout_id', req.params.checkoutId);
+        return res.json({ status: 'failed', amount: data.amount });
       }
     } catch (e) {
       console.error('Status check error:', e.response?.data || e.message);
@@ -222,7 +160,9 @@ router.get('/status/:checkoutId', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  WITHDRAW (Manual — admin pays via PesaPal)
+//  WITHDRAW (Manual — admin pays via PesaPal dashboard)
+//  UNCHANGED — FXS Pay doesn't have a payout/transfer
+//  endpoint yet, so withdrawals stay manual for now.
 // ─────────────────────────────────────────────
 router.post('/withdraw', auth, async (req, res) => {
   const { phone, amount } = req.body;
@@ -233,11 +173,9 @@ router.post('/withdraw', auth, async (req, res) => {
   if (!user || user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
   try {
-    // Deduct balance immediately
     const newBalance = user.balance - amount;
     await supabase.from('users').update({ balance: newBalance }).eq('id', req.user.id);
 
-    // Save withdrawal request as pending
     await supabase.from('transactions').insert({
       user_id: req.user.id,
       amount: -amount,
@@ -246,7 +184,6 @@ router.post('/withdraw', auth, async (req, res) => {
       created_at: new Date()
     });
 
-    // Send email notification to admin via Resend
     try {
       await axios.post('https://api.resend.com/emails', {
         from: 'BetPro Win <onboarding@resend.dev>',
@@ -289,21 +226,7 @@ router.post('/withdraw', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  IPN REGISTRATION HELPER (run once)
-// ─────────────────────────────────────────────
-router.post('/register-ipn', async (req, res) => {
-  try {
-    const token = await getPesapalToken();
-    const ipnId = await ensureIpnRegistered(token);
-    res.json({ success: true, ipn_id: ipnId, message: 'Save this as PESAPAL_IPN_ID in your .env' });
-  } catch (e) {
-    console.error('IPN registration error:', e.response?.data || e.message);
-    res.status(500).json({ error: 'IPN registration failed', detail: e.response?.data });
-  }
-});
-
-// ─────────────────────────────────────────────
-//  BUY GOODS / TILL callbacks (kept from original)
+//  BUY GOODS / TILL callbacks — UNCHANGED
 // ─────────────────────────────────────────────
 router.post('/buygoods/callback', async (req, res) => {
   try {
