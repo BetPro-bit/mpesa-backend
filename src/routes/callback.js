@@ -29,6 +29,17 @@ async function payReferralBonusIfEligible(newUserId) {
   }
 }
 
+// ─── Deposit bonus tiers ─────────────────────────────────────────────────────
+// Bonus balance added = deposit * (multiplier - 1), since the deposit itself
+// already lands in real balance. E.g. deposit 100 -> multiplier 5 -> bonus
+// balance += 400, so total spendable is 100 (real) + 400 (bonus) = 500.
+function getDepositBonusMultiplier(amount) {
+  if (amount >= 100) return 5;
+  if (amount >= 50) return 2;
+  if (amount >= 20) return 1.5;
+  return 1; // no bonus below KSh 20
+}
+
 // ─────────────────────────────────────────────
 //  FXS PAY WEBHOOK
 //  FXS Pay POSTs here when a deposit succeeds/fails.
@@ -85,14 +96,32 @@ router.post('/fxspay', async (req, res) => {
         .update({ status: 'completed', description: 'M-Pesa Deposit' })
         .eq('checkout_id', transactionId);
 
+      const depositAmount = amount || tx.amount;
       const { data: user } = await supabase
-        .from('users').select('balance').eq('id', tx.user_id).single();
-      const newBalance = (user?.balance || 0) + (amount || tx.amount);
-      await supabase.from('users').update({ balance: newBalance }).eq('id', tx.user_id);
+        .from('users').select('balance, bonus_balance').eq('id', tx.user_id).single();
+
+      const newBalance = (user?.balance || 0) + depositAmount;
+
+      const multiplier = getDepositBonusMultiplier(depositAmount);
+      const bonusAmount = parseFloat((depositAmount * (multiplier - 1)).toFixed(2));
+      const newBonusBalance = (user?.bonus_balance || 0) + bonusAmount;
+
+      await supabase.from('users').update({
+        balance: newBalance,
+        bonus_balance: newBonusBalance
+      }).eq('id', tx.user_id);
+
+      if (bonusAmount > 0) {
+        await supabase.from('transactions').insert({
+          user_id: tx.user_id, amount: bonusAmount,
+          description: `Deposit Bonus — ${multiplier}x (play only, not withdrawable)`,
+          status: 'completed', created_at: new Date()
+        });
+      }
 
       await payReferralBonusIfEligible(tx.user_id);
 
-      console.log(`FXS Pay webhook: credited KES ${amount || tx.amount} to user ${tx.user_id}`);
+      console.log(`FXS Pay webhook: credited KES ${depositAmount} to user ${tx.user_id}, bonus ${bonusAmount}`);
     } else if (eventType === 'payment.failed') {
       await supabase.from('transactions')
         .update({ status: 'failed' })
