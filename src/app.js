@@ -17,6 +17,7 @@ app.use('/api/payments', require('./routes/payments'));
 app.use('/api/games', require('./routes/games'));
 app.use('/api/callback', require('./routes/callback'));
 app.use('/api/support', require('./routes/support'));
+app.use('/api/matches', require('./routes/matches'));
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
