@@ -13,17 +13,28 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
-      - key: MPESA_CONSUMER_KEY
+      - key: FXSPAY_BASE_URL
+        value: https://fxspay.onrender.com
+      - key: FXSPAY_API_KEY
         sync: false
-      - key: MPESA_CONSUMER_SECRET
-        sync: false
-      - key: MPESA_SHORTCODE
-        sync: false
-      - key: MPESA_PASSKEY
-        sync: false
-      - key: MPESA_INITIATOR_NAME
-        sync: false
-      - key: MPESA_SECURITY_CREDENTIAL
+      - key: FXSPAY_WEBHOOK_SECRET
         sync: false
       - key: BACKEND_URL
         sync: false
+      # Legacy Daraja vars — unused by any current route (the app now goes
+      # through FXS Pay for all M-Pesa deposits), kept commented out as a
+      # reference only in case of a rollback to routes/callback.js's
+      # /mpesa legacy handler. Uncomment and fill in if you ever need it.
+      # - key: MPESA_CONSUMER_KEY
+      #   sync: false
+      # - key: MPESA_CONSUMER_SECRET
+      #   sync: false
+      # - key: MPESA_SHORTCODE
+      #   sync: false
+      # - key: MPESA_PASSKEY
+      #   sync: false
+      # - key: MPESA_INITIATOR_NAME
+      #   sync: false
+      # - key: MPESA_SECURITY_CREDENTIAL
+      #   sync: false
+
